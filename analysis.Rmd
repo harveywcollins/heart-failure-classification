@@ -1,0 +1,788 @@
+---
+title: "MISCADA_ASML_Classification_summative"
+author: "Z0173057"
+date: "2025-03-08"
+output: html_document
+---
+
+Aim: predict whether a patient will suffer a fatal myocardial infarction
+Target variable: fatal_mi
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Setting Python environment to use Tensorflow from specified environment in R
+
+```{r}
+#Sys.setenv(RETICULATE_PYTHON = "C:/venvs/r-tensorflow/Scripts/python.exe")
+#library(reticulate)
+#use_virtualenv("C:/venvs/r-tensorflow", required = TRUE)
+```
+
+
+## Reading heart failure data
+
+```{r}
+url <- "https://raw.githubusercontent.com/harveywcollins/heart-failure-classification/refs/heads/main/heart_failure.csv"
+data <- read.csv(url, stringsAsFactors = FALSE)
+head(data)
+```
+
+## Data Exploration
+
+```{r}
+library(ggplot2)
+
+summary(data)
+colSums(is.na(data))
+
+library(DataExplorer)
+
+# Uncomment line below to generate report including summaries and plots for every variable
+#create_report(data)
+
+
+DataExplorer::plot_histogram(data, ncol = 3)
+DataExplorer::plot_bar(data, ncol = 3, title = "Frequency Distributions for Categorial Variables")
+DataExplorer::plot_boxplot(data, by = "fatal_mi", ncol =3)
+
+data$fatal_mi <- factor(data$fatal_mi, levels = c(0,1), labels = c("No", "Yes"))
+
+```
+
+## Data Preprocessing and Splitting
+
+```{r}
+
+num_cols <- sapply(data, is.numeric)
+predictor_col <- setdiff(names(data), "fatal_mi")
+data[predictor_col] <- scale(data[predictor_col])
+
+library(caret)
+
+# Remove "anaemia" and "high blood pressure" from the dataset
+
+data_reduced <- subset(data, select = -c(anaemia, high_blood_pressure))
+data <- data_reduced
+
+set.seed(123)
+
+# Create a training set (70% of the data)
+trainIndex <- createDataPartition(data$fatal_mi, p = 0.7, list = FALSE)
+train_data <- data[trainIndex, ]
+
+# Remaining 30% will be split equally into validation and test sets
+temp_data <- data[-trainIndex, ]
+valIndex <- createDataPartition(temp_data$fatal_mi, p = 0.5, list = FALSE)
+validation_data <- temp_data[valIndex, ]
+test_data <- temp_data[-valIndex, ]
+
+cat("Training set:", nrow(train_data), "rows\n")
+cat("Validation set:", nrow(validation_data), "rows\n")
+cat("Test set:", nrow(test_data), "rows\n")
+
+```
+
+
+## Model Selection and Fitting
+
+```{r}
+
+library(rpart)
+library(randomForest)
+library(gbm)
+library(rpart.plot)
+library(pROC)
+library(nnet)
+
+# Logistic Regression Model
+
+logit_model <- glm(fatal_mi ~ ., data = train_data, family = binomial)
+summary(logit_model)
+
+val_preds_prob <- predict(logit_model, newdata = validation_data, type = "response")
+val_preds <- ifelse(val_preds_prob > 0.5, "Yes", "No")
+val_preds <- factor(val_preds, levels = c("No", "Yes"))
+
+confusionMatrix(val_preds, validation_data$fatal_mi)
+
+# CART
+
+cart_control <- trainControl(method = "cv",
+                           number = 50,
+                           classProbs = TRUE,
+                           summaryFunction = twoClassSummary)
+
+cart_model_cv <- train(fatal_mi ~ .,
+                       data = train_data,
+                       method = "rpart",
+                       trControl = cart_control,
+                       metric = "ROC")
+
+
+cart_preds_cv <- predict(cart_model_cv, newdata = validation_data)
+confusionMatrix(cart_preds_cv, validation_data$fatal_mi)
+
+rpart.plot(cart_model_cv$finalModel, main = "CART Tree")
+
+# Random Forest
+
+train_data_rf <- train_data
+
+rf_control <- trainControl(method = "cv",
+                           number = 30,
+                           summaryFunction = twoClassSummary,
+                           classProbs = TRUE,
+                           savePredictions = TRUE)
+
+rf_grid <- expand.grid(mtry = c(floor(sqrt(ncol(train_data) - 1))))
+
+set.seed(123)
+
+rf_model <- train(fatal_mi ~ .,
+                  data = train_data_rf,
+                  method = "rf",
+                  trControl = rf_control,
+                  tuneGrid = rf_grid,
+                  ntree = 25)
+                  
+rf_preds <- predict(rf_model, newdata = validation_data)
+
+confusionMatrix(rf_preds, validation_data$fatal_mi)
+
+varImpPlot(rf_model$finalModel, main = "Variable Importance - Random Forest")
+  
+# Boosting using gbm
+
+gbm_train <- train_data
+
+set.seed(123)
+
+gbm_train$fatal_mi_num <- ifelse(gbm_train$fatal_mi == "Yes", 1, 0)
+
+gbm_validation <- validation_data
+gbm_validation$fatal_mi_num <- ifelse(gbm_validation$fatal_mi == "Yes", 1, 0)
+
+gbm_model <- gbm(fatal_mi_num ~ . - fatal_mi,
+                 data = gbm_train,
+                 distribution = "bernoulli",
+                 n.trees = 60,
+                 interaction.depth = 3,
+                 shrinkage = 0.1,
+                 cv.folds = 5)
+
+best_iter <- gbm.perf(gbm_model, method = "cv", plot.it = FALSE)
+
+gbm_preds_prob <- predict(gbm_model, newdata = gbm_validation, n.trees = best_iter, type = "response")
+gbm_preds <- ifelse(gbm_preds_prob > 0.5, "Yes", "No")
+gbm_preds <- factor(gbm_preds, levels = c("No", "Yes"))
+
+confusionMatrix(gbm_preds, validation_data$fatal_mi)
+
+gbm_varimp <- summary(gbm_model, plotit = FALSE)
+ggplot(gbm_varimp, aes(x = reorder(var, rel.inf), y = rel.inf)) +
+  geom_bar(stat = "identity", fill = "skyblue") +
+  coord_flip() +
+  labs(title = "Variable Importance - GBM", x = "Variable", y = "Relative Influence")
+
+# LDA / QDA Model
+library(MASS)
+
+cv_control <- trainControl(method = "cv",
+                           number = 5,
+                           classProbs = TRUE,
+                           summaryFunction = twoClassSummary)
+
+lda_model_cv <- train(fatal_mi ~ .,
+                      data = train_data,
+                      method = "lda",
+                      metric = "ROC",
+                      trControl = cv_control)
+
+lda_preds_cv <- predict(lda_model_cv, newdata = validation_data)
+confusionMatrix(lda_preds_cv, validation_data$fatal_mi)
+
+
+qda_model_cv <- train(fatal_mi ~ .,
+                      data = train_data,
+                      method = "qda",
+                      metric = "ROC",
+                      trControl = cv_control)
+
+qda_preds_cv <- predict(qda_model_cv, newdata = validation_data)
+confusionMatrix(qda_preds_cv, validation_data$fatal_mi)
+
+# SVM
+
+library(e1071)
+
+svm_model_cv <- train(fatal_mi ~ .,
+                      data = train_data,
+                      method = "svmRadial",
+                      metric = "ROC",
+                      trControl = cv_control)
+
+svm_preds_cv <- predict(svm_model_cv, newdata = validation_data)
+confusionMatrix(svm_preds_cv, validation_data$fatal_mi)
+
+# ROC Curves
+
+roc_logit <- roc(validation_data$fatal_mi, val_preds_prob, levels = c("No", "Yes"))
+
+roc_cart <- roc(validation_data$fatal_mi,
+                predict(cart_model_cv, newdata = validation_data, type = "prob")[, "Yes"],
+                levels = c("No", "Yes"))
+
+roc_rf <- roc(validation_data$fatal_mi,
+                predict(rf_model, newdata = validation_data, type = "prob")[, "Yes"],
+                levels = c("No", "Yes"))
+
+roc_gbm <- roc(gbm_validation$fatal_mi, gbm_preds_prob, levels = c("No", "Yes"))
+
+lda_probs_cv <- predict(lda_model_cv, newdata = validation_data, type = "prob")[, "Yes"]
+qda_probs_cv <- predict(qda_model_cv, newdata = validation_data, type = "prob")[, "Yes"]
+svm_probs_cv <- predict(svm_model_cv, newdata = validation_data, type = "prob")[, "Yes"]
+
+roc_lda <- roc(validation_data$fatal_mi, lda_probs_cv, levels = c("No", "Yes"))
+roc_qda <- roc(validation_data$fatal_mi, qda_probs_cv, levels = c("No", "Yes"))
+roc_svm <- roc(validation_data$fatal_mi, svm_probs_cv, levels = c("No", "Yes"))
+
+auc_lda <- auc(roc_lda)
+auc_qda <- auc(roc_qda)
+auc_svm <- auc(roc_svm)
+
+# Neural Network Model using nnet
+
+library(nnet)
+nn_model <- nnet(fatal_mi ~ ., data = train_data, size = 10, maxit = 200, decay = 0.01, trace = FALSE)
+nn_preds_prob <- predict(nn_model, newdata = validation_data, type = "raw")
+nn_preds <- ifelse(nn_preds_prob > 0.5, "Yes", "No")
+nn_preds <- factor(nn_preds, levels = c("No", "Yes"))
+confusionMatrix(nn_preds, validation_data$fatal_mi)
+roc_nn <- roc(validation_data$fatal_mi, nn_preds_prob, levels = c("No", "Yes"))
+
+# Deep learning framework
+
+library(reticulate)
+library(keras)
+
+set.seed(123)
+
+tensorflow::set_random_seed(27)
+
+train_x <- as.matrix(train_data[, -which(names(train_data) == "fatal_mi")])
+train_y <- ifelse(train_data$fatal_mi == "Yes", 1, 0)
+
+validation_x <- as.matrix(validation_data[, -which(names(validation_data) == "fatal_mi")])
+validation_y <- ifelse(validation_data$fatal_mi == "Yes", 1, 0)
+
+np <- import("numpy")
+train_x <- np$array(train_x, dtype = "float32")
+validation_x <- np$array(validation_x, dtype = "float32")
+train_y <- np$array(train_y, dtype = "float32")
+validation_y <- np$array(validation_y, dtype = "float32")
+
+input <- layer_input(shape = c(as.integer(ncol(train_x))))
+
+output <- input %>%
+  layer_dense(units = 32, activation = "relu") %>%
+  layer_batch_normalization() %>%
+  layer_dropout(rate = 1e-04) %>%
+  layer_dense(units = 32, activation = "relu") %>%
+  layer_batch_normalization() %>%
+  layer_dropout(rate = 1e-04) %>%
+  layer_dense(units = 1, activation = "sigmoid")
+ 
+model <- keras_model(inputs = input, outputs = output)
+
+model$compile(
+  loss = "binary_crossentropy",
+  optimizer = optimizer_rmsprop(),
+  metrics = list("accuracy")
+)
+
+early_stop <- callback_early_stopping(monitor = "val_loss", patience = 5)
+
+history <- model$fit(
+  train_x, train_y,
+  epochs = as.integer(75),
+  batch_size = as.integer(100),
+  validation_data = list(validation_x, validation_y),
+  callbacks = list(early_stop)
+)
+
+pred_val_prob_deep <- model$predict(validation_x)
+roc_deep <- roc(validation_data$fatal_mi, pred_val_prob_deep, levels = c("No", "Yes"))
+
+# Super Learner using mlr3 stacking
+
+library(mlr3)
+library(mlr3learners)
+library(mlr3pipelines)
+
+heart_task <- TaskClassif$new(id = "heart failure", backend = train_data, target = "fatal_mi", positive = "Yes")
+
+lrn_rpart <- lrn("classif.rpart", predict_type = "prob")
+lrn_rf <- lrn("classif.ranger", predict_type = "prob")
+lrn_logreg <- lrn("classif.log_reg", predict_type = "prob")
+lrn_xgb <- lrn("classif.xgboost", predict_type = "prob")
+lrn_nn_mlr <- lrn("classif.nnet", predict_type = "prob", size = 5, maxit = 200, trace = FALSE)
+
+library(data.table)
+library(ranger)
+library(xgboost)
+
+stack_graph <- gunion(list(
+  po("learner_cv", lrn_rpart, id = "rpart"),
+  po("learner_cv", lrn_rf, id = "rf"),
+  po("learner_cv", lrn_logreg, id = "logreg"),
+  po("learner_cv", lrn_xgb, id = "xgb"),
+  po("learner_cv", lrn_nn_mlr, id = "nnet")
+)) %>>%
+  po("featureunion", id = "featunion") %>>%
+  po("learner", lrn("classif.log_reg", predict_type = "prob"), id = "metalearner")
+
+stack_learner <- GraphLearner$new(stack_graph)
+
+stack_learner$train(heart_task)
+
+heart_task_val <- TaskClassif$new(id = "heart_failure_val", backend = validation_data, target = "fatal_mi", positive = "Yes")
+stack_preds <- stack_learner$predict(heart_task_val)$prob[, "Yes"]
+roc_stack <- roc(validation_data$fatal_mi, stack_preds, levels = c("No", "Yes"))
+
+plot(roc_logit, col = "blue", main = "ROC Curves for Models based on Training Data")
+lines(roc_cart, col = "green")
+lines(roc_rf, col = "red")
+lines(roc_gbm, col = "purple")
+lines(roc_nn, col = "orange")
+lines(roc_stack, col = "brown")
+lines(roc_deep, col = "darkcyan")
+lines(roc_lda, col = "pink")
+lines(roc_qda, col = "brown")
+lines(roc_svm, col = "darkgreen")
+legend("bottomright", legend = c("Logistic Regression", "CART", "Random Forest", "GBM", "Neural Network", "Super Learner", "Deep Keras", "LDA", "QDA", "SVM"),
+       cex = 0.9,
+       col = c("blue", "green", "red", "purple", "orange", "brown", "darkcyan", "pink", "brown", "darkgreen"), lwd = 2)
+
+# Calculate AUC for each model
+
+auc_logit <- auc(roc_logit)
+auc_cart <- auc(roc_cart)
+auc_rf <- auc(roc_rf)
+auc_gbm <- auc(roc_gbm)
+auc_nn <- auc(roc_nn)
+auc_stack <- auc(roc_stack)
+auc_deep <- auc(roc_deep)
+
+auc_values <- c(Logistic = auc_logit, CART = auc_cart, RandomForest = auc_rf, GBM = auc_gbm, NeuralNetwork = auc_nn, SuperLearner = auc_stack, DeepKeras = auc_deep, LDA = auc_lda, QDA = auc_qda, SVM = auc_svm)
+print(auc_values)
+
+best_model <- names(which.max(auc_values))
+cat("The best performing model based on AUC is:", best_model, "with an AUC of", max(auc_values), "\n")
+
+
+```
+
+```{r}
+# Optimal number of trees for train dataset
+
+library(caret)
+library(pROC)
+
+ntree_values <- c(20, 25, 30, 35)
+results <- data.frame()
+
+for (nt in ntree_values) {
+  set.seed(123)
+  rf_tuned <- train(fatal_mi ~ .,
+                  data = train_data_rf,
+                  method = "rf",
+                  metric = "ROC",
+                  trControl = rf_control,
+                  tuneGrid = rf_grid,
+                  ntree = nt)
+  
+  best_roc <- max(rf_tuned$results$ROC)
+  results <- rbind(results, data.frame(ntree = nt, ROC = best_roc))
+}
+
+print(results)
+
+best <- results[which.max(results$ROC), ]
+cat("Optimal ntree:", best$ntree, "with ROC", best$ROC, "\n")
+
+```
+
+# Generate files for hypertuning of deep learning model
+
+```{r}
+saveRDS(train_x, "train_x.rds")
+saveRDS(train_y, "train_y.rds")
+saveRDS(validation_x, "validation_x.rds")
+saveRDS(validation_y, "validation_y.rds")
+
+```
+
+# Hypertuning for deep learning
+
+```{r}
+
+library(tfruns)
+
+runs <- tuning_run("optimise_deepNN.R",
+  flags = list(
+    units = c(64L, 128L),
+    dropout_rate = c(0.01, 0.1),
+    epochs = c(75L, 100L),
+    batch_size = c(100L, 200L),
+    learning_rate = c(1e-04, 1e-05)
+  )
+)
+
+runs_df <- tfruns::ls_runs(order = "metric_metric_auc", decreasing = TRUE)
+
+best_run <- runs_df[1, ]
+cat("Best hyperparameter combination:\n")
+cat("units:", best_run$flag_units, "\n")
+cat("dropout_rate:", best_run$flag_dropout_rate, "\n")
+cat("epochs:", best_run$flag_epochs, "\n")
+cat("batch_size:", best_run$flag_batch_size, "\n")
+cat("learning_rate:", best_run$flag_learning_rate, "\n")
+cat("Validation AUC:", best_run$metric_metric_auc, "\n")
+
+```
+
+# Alternative Deep Learning Architecture with L2 Regularisation and Increased Dropout
+```{r}
+
+library(reticulate)
+library(keras)
+
+set.seed(123)
+
+tensorflow::set_random_seed(27)
+
+train_x <- as.matrix(train_data[, -which(names(train_data) == "fatal_mi")])
+train_y <- ifelse(train_data$fatal_mi == "Yes", 1, 0)
+
+validation_x <- as.matrix(validation_data[, -which(names(validation_data) == "fatal_mi")])
+validation_y <- ifelse(validation_data$fatal_mi == "Yes", 1, 0)
+
+np <- import("numpy")
+train_x <- np$array(train_x, dtype = "float32")
+validation_x <- np$array(validation_x, dtype = "float32")
+train_y <- np$array(train_y, dtype = "float32")
+validation_y <- np$array(validation_y, dtype = "float32")
+
+input <- layer_input(shape = c(as.integer(ncol(train_x))))
+
+tf <- import("tensorflow")
+l2_reg <- tf$keras$regularizers$l2(1e-5)
+
+output <- input %>%
+  layer_dense(units = 32, activation = "relu", kernel_regularizer = l2_reg) %>%
+  layer_batch_normalization() %>%
+  layer_dropout(rate = 1e-04) %>%
+  layer_dense(units = 32, activation = "relu", kernel_regularizer = l2_reg) %>%
+  layer_batch_normalization() %>%
+  layer_dropout(rate = 1e-04) %>%
+  layer_dense(units = 1, activation = "sigmoid")
+ 
+model <- keras_model(inputs = input, outputs = output)
+
+model$compile(
+  loss = "binary_crossentropy",
+  optimizer = optimizer_rmsprop(),
+  metrics = list("accuracy")
+)
+
+early_stop <- callback_early_stopping(monitor = "val_loss", patience = 5)
+
+history <- model$fit(
+  train_x, train_y,
+  epochs = as.integer(75),
+  batch_size = as.integer(140),
+  validation_data = list(validation_x, validation_y),
+  callbacks = list(early_stop),
+  verbose = 0
+)
+
+pred_val_prob_deep <- model$predict(validation_x)
+roc_deep <- roc(validation_data$fatal_mi, pred_val_prob_deep, levels = c("No", "Yes"))
+auc_deep <- auc(roc_deep)
+
+test_x <- as.matrix(test_data[, -which(names(test_data) == "fatal_mi")])
+test_y <- ifelse(test_data$fatal_mi == "Yes", 1, 0)
+
+np <- import("numpy")
+test_x <- np$array(test_x, dtype = "float32")
+test_y <- np$array(test_y, dtype = "float32")
+
+pred_test_prob <- model$predict(test_x)
+roc_test <- roc(test_data$fatal_mi, pred_test_prob, levels = c("No", "Yes"))
+test_auc <- auc(roc_test)
+cat("Validation AUC for Deep Learning with L2 regularisation:", auc_deep, "\n")
+cat("Test AUC:", test_auc, "\n")
+
+```
+
+
+## Evaluation on the test set
+
+```{r}
+
+# Evaluate Random Forest on Test set
+
+rf_test_preds_prob <- predict(rf_tuned, newdata = test_data, type = "prob")[, "Yes"]
+rf_test_preds <- ifelse(rf_test_preds_prob > 0.5, "Yes", "No")
+rf_test_preds <- factor(rf_test_preds, levels = c("No", "Yes"))
+
+rf_cm <- confusionMatrix(rf_test_preds, test_data$fatal_mi)
+print(rf_cm)
+
+roc_rf_test <- roc(test_data$fatal_mi, rf_test_preds_prob, levels = c("No", "Yes"))
+plot(roc_rf_test, col = "red", main = "ROC Curve - Random Forest")
+auc_rf_test <- auc(roc_rf_test)
+
+# Evaluate Deep Learning Model on Test set
+
+test_x <- as.matrix(test_data[, -which(names(test_data) == "fatal_mi")])
+test_y <- ifelse(test_data$fatal_mi == "Yes", 1, 0)
+
+np <- import("numpy")
+test_x <- np$array(test_x, dtype = "float32")
+test_y <- np$array(test_y, dtype = "float32")
+
+pred_test_prob_deep <- model$predict(test_x)
+pred_test_class_deep <- ifelse(pred_test_prob_deep > 0.5, "Yes", "No")
+pred_test_class_deep <- factor(pred_test_class_deep, levels = c("No", "Yes"))
+
+deep_cm <- confusionMatrix(pred_test_class_deep, test_data$fatal_mi)
+print(deep_cm)
+
+roc_deep_test <- roc(test_data$fatal_mi, pred_test_prob_deep, levels = c("No", "Yes"))
+plot(roc_deep_test, col = "blue", main = "ROC Curve - Deep Learning")
+auc_deep_test <- auc(roc_deep_test)
+cat("Test AUC for Random Forest:", auc_rf_test, "\n")
+cat("Test AUC for Deep Learning:", auc_deep_test, "\n")
+
+plot(roc_rf_test, col = "red", main = "ROC Curves based on Unseen Data", lwd = 2)
+lines(roc_deep_test, col = "blue", lwd = 2)
+legend("bottomright", legend = c("Random Forest", "Deep Keras"),
+       col = c("red", "blue"), lwd = 2)
+```
+
+## Calibration Plots
+
+```{r}
+
+library(dplyr)
+
+calibration_data_deep <- data.frame(
+  predicted = as.numeric(pred_test_prob),
+  observed = ifelse(test_data$fatal_mi == "Yes", 1, 0)
+)
+
+calibration_data_deep$bin <- cut(calibration_data_deep$predicted, breaks = seq(0, 1, by = 0.1), include.lowest = TRUE)
+
+calib_summary_deep <- aggregate(cbind(predicted, observed) ~ bin, data = calibration_data_deep, FUN = mean)
+
+calib_summary_deep$model <- "Deep Keras"
+
+calibration_data_rf <- data.frame(
+  predicted = as.numeric(rf_test_preds_prob),
+  observed = ifelse(test_data$fatal_mi == "Yes", 1, 0)
+)
+
+calibration_data_rf$bin <- cut(calibration_data_rf$predicted,
+                               breaks = seq(0, 1, by = 0.1),
+                               include.lowest = TRUE)
+
+calib_summary_rf <- aggregate(cbind(predicted, observed) ~ bin, data = calibration_data_rf, FUN = mean)
+
+calib_summary_rf$model <- "Random Forest"
+
+calib_combined <- bind_rows(calib_summary_deep, calib_summary_rf)
+
+ggplot(calib_combined, aes(x = predicted, y = observed, color = model, group = model)) +
+  geom_point(size = 3) +
+  geom_line() +
+  geom_abline(intercept = 0, slope = 1, linetype = "dashed", color = "gray") +
+  theme_minimal(base_size = 14) +
+  labs(title = "Calibration Plot: Deep Keras vs. Random Forest",
+    x = "Mean Predicted Probability",
+    y = "Observed Fequency",
+    color = "Model"
+  ) +
+  theme(
+    plot.title = element_text(),
+    legend.position = "bottom"
+  )
+
+```
+```{r}
+
+pred_val_prob <- model$predict(validation_x)
+
+thresholds <- seq(0.1, 0.9, by = 0.01)
+
+sens_keras <- numeric(length(thresholds))
+spec_keras <- numeric(length(thresholds))
+
+for(i in seq_along(thresholds)) {
+  pred_class <- ifelse(pred_val_prob > thresholds[i], "Yes", "No")
+  pred_class <- factor(pred_class, levels = c("No", "Yes"))
+  
+  cm <- confusionMatrix(pred_class, validation_data$fatal_mi)
+  
+  sens_keras[i] <- cm$byClass["Sensitivity"]
+  spec_keras[i] <- cm$byClass["Specificity"]
+}
+
+youden_keras <- sens_keras + spec_keras - 1
+
+best_idx_keras <- which.max(youden_keras)
+best_threshold_keras <- thresholds[best_idx_keras]
+
+cat("Optimal threshold based on Youden's index (Deep Keras):", best_threshold_keras, "\n")
+
+```
+```{r}
+
+rf_val_prob <- predict(rf_model, newdata = validation_data, type = "prob")[, "Yes"]
+
+thresholds <- seq(0.1, 0.9, by = 0.01)
+
+sens_rf <- numeric(length(thresholds))
+spec_rf <- numeric(length(thresholds))
+
+for(i in seq_along(thresholds)) {
+  pred_class <- ifelse(rf_val_prob > thresholds[i], "Yes", "No")
+  pred_class <- factor(pred_class, levels = c("No", "Yes"))
+  
+  cm <- confusionMatrix(pred_class, validation_data$fatal_mi)
+  
+  sens_rf[i] <- cm$byClass["Sensitivity"]
+  spec_rf[i] <- cm$byClass["Specificity"]
+}
+
+youden_rf <- sens_rf + spec_rf - 1
+
+best_idx_rf <- which.max(youden_rf)
+best_threshold_rf <- thresholds[best_idx_rf]
+
+cat("Optimal threshold based on Youden's index (Random Forest):", best_threshold_rf, "\n")
+
+par(mfrow = c(1,2), mar = c(4, 4, 3, 1), oma = c(0, 0, 2, 0))
+
+plot(thresholds, sens_keras, type = "l", col = "red", lwd = 2,
+     xlab = "Threshold", ylab = "Metric",
+     main = "(a) Deep Keras")
+lines(thresholds, spec_keras, col = "blue", lwd = 2)
+legend("bottomright", legend = c("Sensitivity", "Specificity"),
+       col = c("red", "blue"), lwd = 2, cex = 0.8)
+
+plot(thresholds, sens_rf, type = "l", col = "red", lwd = 2,
+     xlab = "Threshold", ylab = "Metric",
+     main = "(b) Random Forest")
+lines(thresholds, spec_rf, col = "blue", lwd = 2)
+legend("bottomright", legend = c("Sensitivity", "Specificity"),
+       col = c("red", "blue"), lwd = 2, cex = 0.8)
+
+mtext("Tuning Threshold Plots", outer = TRUE, cex = 1.2, font = 2)
+
+```
+```{r}
+
+rf_test_preds <- ifelse(rf_test_preds_prob > 0.5, "Yes", "No")
+rf_test_preds <- factor(rf_test_preds, levels = c("No", "Yes"))
+cm_rf <- confusionMatrix(rf_test_preds, test_data$fatal_mi)
+rf_correct <- sum(diag(cm_rf$table))
+rf_incorrect <- sum(cm_rf$table) - rf_correct
+
+deep_test_preds <- ifelse(pred_test_prob_deep > 0.5, "Yes", "No")
+deep_test_preds <- factor(deep_test_preds, levels = c("No", "Yes"))
+cm_deep <- confusionMatrix(deep_test_preds, test_data$fatal_mi)
+deep_correct <- sum(diag(cm_deep$table))
+deep_incorrect <- sum(cm_deep$table) - deep_correct
+
+results <- data.frame(
+  Model = rep(c("Random Forest", "Deep Keras"), each = 2),
+  Outcome = rep(c("Correct", "Incorrect"), times = 2),
+  Count = c(rf_correct, rf_incorrect, deep_correct, deep_incorrect)
+)
+
+ggplot(results, aes(x = Model, y = Count, fill = Outcome)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  labs(title = "Test Set Prediction Outcomes",
+       x = "Model",
+       y = "Number of Predictions") +
+  scale_fill_manual(values = c("Correct" = "steelblue", "Incorrect" = "tomato")) +
+  theme_minimal() +
+  theme(text = element_text(size=12))
+```
+## PLEASE NOTE THAT THIS WAS NOT USED IN THE FINAL REPORT AS IT MADE THE AUC VALUE WORST
+## Data Augmentation via Noise Injection
+
+```{r}
+augment_data <- function(x, noise_level = 0.0001) {
+  noise <- matrix(rnorm(n = length(x), mean = 0, sd = noise_level), nrow = nrow(x))
+  return(x + noise)
+}
+
+train_x_aug <- augment_data(train_x, noise_level = 0.0001)
+
+build_model <- function() {
+  input <- layer_input(shape = c(ncol(train_x)))
+  
+  output <- input %>%
+    layer_dense(units = 32, activation = "relu") %>%
+    layer_batch_normalization() %>%
+    layer_dropout(rate = 1e-04) %>%
+    layer_dense(units = 32, activation = "relu") %>%
+    layer_batch_normalization() %>%
+    layer_dropout(rate = 1e-04) %>%
+    layer_dense(units = 1, activation = "sigmoid")
+  
+  model <- keras_model(inputs = input, outputs = output)
+  
+  model$compile(
+    loss = "binary_crossentropy",
+    optimizer = optimizer_rmsprop(),
+    metrics = list("accuracy")
+  )
+  
+  model
+}
+
+model_aug <- build_model()
+
+history_alt_aug <- model_aug$fit(
+  train_x_aug, train_y,
+  epochs = as.integer(75),
+  batch_size = as.integer(140),
+  validation_data = list(validation_x, validation_y),
+  callbacks = list(early_stop),
+  verbose = 0
+)
+
+pred_val_prob_alt <- model_aug$predict(validation_x)
+roc_deep_aug <- roc(validation_data$fatal_mi, pred_val_prob_alt, levels = c("No", "Yes"))
+auc_deep_aug <- auc(roc_deep_aug)
+
+test_x <- as.matrix(test_data[, -which(names(test_data) == "fatal_mi")])
+test_y <- ifelse(test_data$fatal_mi == "Yes", 1, 0)
+
+np <- import("numpy")
+test_x <- np$array(test_x, dtype = "float32")
+test_y <- np$array(test_y, dtype = "float32")
+
+pred_test_prob <- model$predict(test_x)
+roc_test <- roc(test_data$fatal_mi, pred_test_prob, levels = c("No", "Yes"))
+test_auc <- auc(roc_test)
+cat("Validation AUC for Deep Learning with Augementation:", auc_deep_aug, "\n")
+cat("Test AUC:", test_auc, "\n")
+
+```
