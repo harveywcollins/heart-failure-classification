@@ -7,7 +7,7 @@ This repository contains the code for predicting fatal myocardial infarctions (h
 The primary R Markdown file containing data exploration, model training code, hyperparameter tuning, calibration plots, threshold analysis and final model evaluation.
 - report.R
 A master R script that runs the main analysis. This file would run to produce the final outputs (HTML report).
-- data
+- data titled `heart_failure.csv`
 - optimise_deepNN.r
 A script employing `tfruns` for hyperparameter tuning of the deep neueral network.
 
