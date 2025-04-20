@@ -20,4 +20,4 @@ A script employing `tfruns` for hyperparameter tuning of the deep neueral networ
 # Requirements
 - R.4.4.2 or later
 - Packages: `caret`, `pROC`, `randomForest`, `gbm`, `e1071`, `nnet`, `rpart`, `keras`, `reticulate`, `mlr3verse`, `DataExplorer`, `tfruns`, etc.
-- TensorFlow enviornment (if running deep Keras models) and a working Python environment with the appropiate packages if using `reticulate`.
+- TensorFlow environment (if running deep Keras models) and a working Python environment with the appropiate packages if using `reticulate`.
