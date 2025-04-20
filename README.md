@@ -8,7 +8,7 @@ The primary R Markdown file containing data exploration, model training code, hy
 - `report.R`
 A master R script that runs the main analysis. This file would run to produce the final outputs (HTML report).
 - data titled `heart_failure.csv`
-- optimise_deepNN.r
+- `optimise_deepNN.r`
 A script employing `tfruns` for hyperparameter tuning of the deep neueral network.
 
 # Usage
